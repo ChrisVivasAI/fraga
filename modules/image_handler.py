@@ -9,7 +9,15 @@ import cv2
 import numpy as np
 import json
 import time
-import uuid # Import uuid for unique filenames
+import uuid  # Import uuid for unique filenames
+
+from .image_db import (
+    store_image_in_db,
+    get_images_from_db,
+    update_image_analysis,
+    check_images_processed,
+)
+from .image_utils import extract_embedded_images, render_full_page
 
 # Import shared resources for Ollama client and model name
 from .shared_resources import (
@@ -21,267 +29,11 @@ from .shared_resources import (
 logger = logging.getLogger(__name__)
 ollama_client = get_ollama_client()
 ollama_model_name = get_ollama_model_name()
+
 supabase = get_supabase_client()
 
 # Define bucket name (make sure this matches your Supabase bucket)
 STORAGE_BUCKET_NAME = 'project-images'
-
-# --- Database Functions for Image Storage ---
-def store_image_in_db(
-    project_id: int, 
-    file_name: str, 
-    image_data: bytes, 
-    page_num: int, 
-    position_data: Dict[str, Any]
-) -> Optional[int]:
-    """
-    Uploads image to Supabase Storage, stores URL and base64 in the database.
-    
-    Args:
-        project_id: ID of the project
-        file_name: Name of the source PDF file
-        image_data: Binary image data
-        page_num: Page number where image was found
-        position_data: Dictionary with x, y, width, height info
-        
-    Returns:
-        ID of the inserted image record, or None if storage failed
-    """
-    if not supabase:
-        logger.error("Supabase client not available. Cannot store image.")
-        return None
-    if not image_data:
-        logger.error("No image data provided to store_image_in_db")
-        return None
-        
-    image_url = None
-    image_id = None
-    upload_error = None
-
-    try:
-        # 1. Upload image bytes to Supabase Storage
-        # Generate a unique filename
-        unique_filename = f"project_{project_id}/image_{uuid.uuid4()}.png"
-        
-        try:
-            # Ensure image_data is in the right format by converting it to PNG using PIL
-            try:
-                # Convert bytes to PIL Image and back to ensure proper format
-                pil_img = Image.open(io.BytesIO(image_data))
-                img_byte_arr = io.BytesIO()
-                pil_img.save(img_byte_arr, format='PNG')
-                clean_img_bytes = img_byte_arr.getvalue()
-                
-                logger.info(f"Uploading image to Supabase Storage: {STORAGE_BUCKET_NAME}/{unique_filename}")
-                response = supabase.storage.from_(STORAGE_BUCKET_NAME).upload(unique_filename, clean_img_bytes)
-                logger.debug(f"Storage upload response: {response}")
-            except Exception as img_err:
-                logger.error(f"Failed to process image before upload: {img_err}")
-                # Try direct upload as fallback
-                logger.info(f"Trying direct upload to: {STORAGE_BUCKET_NAME}/{unique_filename}")
-                response = supabase.storage.from_(STORAGE_BUCKET_NAME).upload(unique_filename, image_data)
-            
-            # 2. Get the public URL of the uploaded image
-            url_response = supabase.storage.from_(STORAGE_BUCKET_NAME).get_public_url(unique_filename)
-            if isinstance(url_response, str): # Check if response is the URL string
-                 image_url = url_response
-                 logger.info(f"Successfully uploaded image. Public URL: {image_url}")
-            else:
-                # Handle cases where URL retrieval might fail or return unexpected format
-                logger.error(f"Failed to get public URL for {unique_filename}. Response: {url_response}")
-                upload_error = "Failed to get image public URL"
-                
-        except Exception as storage_err:
-             logger.error(f"Error uploading image to Supabase Storage: {storage_err}", exc_info=True)
-             upload_error = f"Storage upload failed: {storage_err}"
-             
-        # Proceed to DB insert only if upload was potentially successful
-        if upload_error:
-             st.error(f"Failed to store image in cloud storage: {upload_error}")
-             return None
-
-        # 3. Encode image data to base64 for analysis purposes
-        try:
-            # Ensure we're using image data that can be properly encoded to valid base64
-            # Convert image to a standard format (PNG) before encoding to ensure consistency
-            pil_img = Image.open(io.BytesIO(image_data))
-            img_byte_arr = io.BytesIO()
-            pil_img.save(img_byte_arr, format='PNG')
-            clean_img_bytes = img_byte_arr.getvalue()
-            
-            # Encode the cleaned image data to base64
-            image_data_b64 = base64.b64encode(clean_img_bytes).decode('utf-8')
-            
-            # Validate the base64 string by attempting to decode it
-            test_decode = base64.b64decode(image_data_b64)
-            logger.info(f"Successfully encoded image to base64 (length: {len(image_data_b64)})")
-        except Exception as encode_err:
-            logger.error(f"Error encoding image to base64: {encode_err}")
-            # Fallback to direct encoding if the clean approach fails
-            image_data_b64 = base64.b64encode(image_data).decode('utf-8')
-        
-        # 4. Convert position data to JSON string
-        position_json = json.dumps(position_data)
-        
-        # 5. Insert metadata (including URL and base64) into database
-        db_payload = {
-            "project_id": project_id,
-            "file_name": file_name,
-            "image_url": image_url, # Store the URL for display
-            "image_data": image_data_b64, # Store base64 for analysis
-            "page_num": page_num,
-            "position_data": position_json
-        }
-        logger.info(f"Inserting image metadata into DB for project {project_id}")
-        db_response = supabase.table('images').insert(db_payload).execute()
-        
-        if hasattr(db_response, 'data') and db_response.data and len(db_response.data) > 0:
-            image_id = db_response.data[0]['id']
-            logger.info(f"Successfully stored image record ID: {image_id} (Project: {project_id}, File: {file_name}) linked to URL: {image_url}")
-            return image_id
-        else:
-            db_error_info = getattr(db_response, 'error', 'Unknown DB error')
-            logger.error(f"Failed to store image metadata in Supabase: {db_error_info}. Payload: {db_payload}")
-            # If DB insert fails after successful storage upload, we might have an orphaned file.
-            # Consider adding cleanup logic here if needed:
-            # if image_url:
-            #     logger.warning(f"DB insert failed for image {image_id}, attempting to remove orphaned file: {unique_filename}")
-            #     try:
-            #         supabase.storage.from_(STORAGE_BUCKET_NAME).remove([unique_filename])
-            #     except Exception as remove_err:
-            #         logger.error(f"Failed to remove orphaned storage file {unique_filename}: {remove_err}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error storing image (Project: {project_id}, File: {file_name}): {e}", exc_info=True)
-        return None
-
-def get_images_from_db(project_id: int, file_name: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Retrieve image metadata (URL for display, base64 for analysis) from the database 
-    for a specific project, optionally filtered by file name.
-    
-    Args:
-        project_id: ID of the project
-        file_name: Optional file name to filter results
-        
-    Returns:
-        List of image records containing metadata including image_url and image_data_b64.
-    """
-    logger.info(f"[DEBUG] get_images_from_db called for project_id: {project_id}, file_name: {file_name}")
-    if not supabase:
-        logger.error("Supabase client not available. Cannot retrieve images.")
-        return []
-        
-    try:
-        # Select all necessary columns, including image_url and image_data (for base64)
-        query = supabase.table('images').select(
-            'id, project_id, file_name, page_num, position_data, analysis, image_url, image_data'
-        ).eq('project_id', project_id)
-        
-        if file_name:
-            query = query.eq('file_name', file_name)
-            
-        response = query.execute()
-        logger.debug(f"[DEBUG] Supabase response object: {response}")
-        
-        if hasattr(response, 'data') and response.data:
-            logger.info(f"[DEBUG] Found {len(response.data)} raw records in Supabase response for project {project_id}.")
-            images = []
-            for img_record in response.data:
-                try:
-                    # Rename image_data to image_data_b64 for clarity in the dictionary
-                    img_record['image_data_b64'] = img_record.pop('image_data', None)
-                    
-                    # Ensure image_url exists, default to None if missing in DB record
-                    img_record['image_url'] = img_record.get('image_url')
-                    
-                    # Parse position data from JSON
-                    if isinstance(img_record.get('position_data'), str):
-                        img_record['position_data'] = json.loads(img_record['position_data'])
-                    else:
-                        # Ensure position_data is a dict even if null/invalid in DB
-                        img_record['position_data'] = img_record.get('position_data') or {}
-                        
-                    images.append(img_record)
-                except Exception as parse_err:
-                    # Log error if JSON parsing or key handling fails, but skip the problematic record
-                    logger.error(f"Error processing DB record for image ID {img_record.get('id')}: {parse_err}")
-                    continue 
-                    
-            logger.info(f"[DEBUG] Successfully prepared {len(images)} records out of {len(response.data)} found.")
-            logger.info(f"Retrieved metadata for {len(images)} images for project ID: {project_id}")
-            return images
-        else:
-            if hasattr(response, 'data'):
-                logger.warning(f"[DEBUG] Supabase response has 'data' attribute, but it's empty or None for project {project_id}.")
-            else:
-                 logger.warning(f"[DEBUG] Supabase response does not have 'data' attribute for project {project_id}.")
-            logger.info(f"No image metadata found for project ID: {project_id}")
-            return []
-            
-    except Exception as e:
-        logger.error(f"Error retrieving image metadata from database: {e}", exc_info=True)
-        return []
-
-def update_image_analysis(image_id: int, analysis: str) -> bool:
-    """
-    Update the analysis for a specific image.
-    
-    Args:
-        image_id: ID of the image to update
-        analysis: Text analysis to store
-        
-    Returns:
-        True if update was successful, False otherwise
-    """
-    if not supabase:
-        logger.error("Supabase client not available. Cannot update image analysis.")
-        return False
-        
-    try:
-        response = supabase.table('images').update({
-            "analysis": analysis
-        }).eq('id', image_id).execute()
-        
-        if hasattr(response, 'data') and response.data:
-            logger.info(f"Successfully updated analysis for image ID: {image_id}")
-            return True
-        else:
-            error_info = getattr(response, 'error', 'Unknown error')
-            logger.error(f"Failed to update image analysis in Supabase: {error_info}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error updating image analysis: {e}", exc_info=True)
-        return False
-
-def check_images_processed(project_id: int, file_name: str) -> bool:
-    """
-    Check if images for a specific project and file have already been processed.
-    
-    Args:
-        project_id: ID of the project
-        file_name: Name of the file to check
-        
-    Returns:
-        True if images exist in the database, False otherwise
-    """
-    if not supabase:
-        return False
-        
-    try:
-        # Count images for this project and file
-        response = supabase.table('images').select('id', count='exact').eq('project_id', project_id).eq('file_name', file_name).execute()
-        
-        if hasattr(response, 'count') and response.count > 0:
-            logger.info(f"Found {response.count} existing images for project {project_id}, file {file_name}")
-            return True
-        return False
-        
-    except Exception as e:
-        logger.error(f"Error checking processed images: {e}", exc_info=True)
-        return False
 
 # Remove caching for this version as direct extraction is fast
 # @st.cache_data(ttl=3600, show_spinner=False)
@@ -305,82 +57,16 @@ def extract_images_from_pdf(pdf_file: io.BytesIO, min_area_ratio=0.02, dpi=150) 
 
         for page_num in range(pdf_document.page_count):
             page = pdf_document[page_num]
-            
-            # 1. Existing logic: Extract embedded images
-            image_list = page.get_images(full=True) # Get full image info
-            
-            if image_list: # Check if there are any embedded images on the page
-                logger.info(f"Found {len(image_list)} potential embedded image references on page {page_num + 1}.")
-                for img_index, img_info in enumerate(image_list):
-                    xref = img_info[0]
-                    if xref == 0:
-                        logger.warning(f"Skipping invalid xref 0 for embedded image on page {page_num + 1}, image index {img_index}")
-                        continue
-                    
-                    try:
-                        base_image = pdf_document.extract_image(xref)
-                        if not base_image:
-                            logger.warning(f"Could not extract embedded image for xref {xref} on page {page_num + 1}.")
-                            continue
-                            
-                        image_bytes = base_image["image"] # Raw image bytes
-                        if not image_bytes:
-                            logger.warning(f"Embedded image for xref {xref} has no data (page {page_num + 1}).")
-                            continue
-                        
-                        # Convert to PIL Image for display and getting dimensions
-                        try:
-                            pil_image = Image.open(io.BytesIO(image_bytes))
-                        except Exception as pil_err:
-                            logger.warning(f"Could not open extracted embedded image bytes with PIL for xref {xref} on page {page_num + 1}: {pil_err}")
-                            continue # Skip if PIL can't open it
-                        
-                        # Position data for embedded images
-                        position_data = {
-                            "x": 0, # Placeholder - Fitz extract_image doesn't directly give bounding box of original image on page easily
-                            "y": 0, # Placeholder
-                            "width": pil_image.width,
-                            "height": pil_image.height,
-                            "source": "embedded",
-                            "xref": xref
-                        }
-                        
-                        extracted_data.append((pil_image, image_bytes, position_data, page_num))
-                        logger.info(f"Successfully extracted embedded image xref {xref} from page {page_num + 1} ({pil_image.width}x{pil_image.height}).")
-                        
-                    except Exception as extract_err:
-                        logger.error(f"Error extracting/processing embedded image xref {xref} on page {page_num + 1}: {extract_err}", exc_info=False)
-                        continue
-            else:
-                logger.info(f"No embedded images found on page {page_num + 1}.")
 
-            # 2. New logic: Create full-page rendering
+            # Embedded images
+            extracted_data.extend(extract_embedded_images(page, pdf_document, page_num))
+
+            # Full page render
             try:
                 logger.info(f"Rendering full page {page_num + 1} at {dpi} DPI...")
-                pix = page.get_pixmap(dpi=dpi, alpha=False)
-                page_image_bytes = pix.tobytes("png") # Get bytes in PNG format
-
-                if not page_image_bytes:
-                    logger.warning(f"Full page rendering for page {page_num + 1} resulted in no data.")
-                    continue
-
-                page_pil_image = Image.open(io.BytesIO(page_image_bytes))
-                
-                position_data_page = {
-                    "x": 0,
-                    "y": 0,
-                    "width": page_pil_image.width, # or pix.width
-                    "height": page_pil_image.height, # or pix.height
-                    "source": "full_page_render",
-                    "xref": 0 # Not applicable for full page render
-                }
-                
-                extracted_data.append((page_pil_image, page_image_bytes, position_data_page, page_num))
-                logger.info(f"Successfully rendered full page {page_num + 1} ({page_pil_image.width}x{page_pil_image.height}).")
-
+                extracted_data.append(render_full_page(page, page_num, dpi))
             except Exception as page_render_err:
                 logger.error(f"Error rendering full page {page_num + 1}: {page_render_err}", exc_info=True)
-                # Continue to next page even if full page render fails
 
         pdf_document.close()
         logger.info(f"Image extraction (embedded + full page) finished. Found {len(extracted_data)} images in total.")
