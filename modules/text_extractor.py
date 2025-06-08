@@ -12,6 +12,14 @@ import hashlib
 import time
 from typing import List, Dict, Any, Tuple, Optional
 
+from .text_utils import (
+    preprocess_image,
+    clean_ocr_text,
+    preprocess_technical_text,
+    chunk_text_with_context,
+)
+from .document_summary_utils import generate_document_summary
+
 # Import shared resources
 from .shared_resources import ( # Use relative import within the package
     get_supabase_client,
@@ -74,220 +82,6 @@ def init_extraction_state():
         st.session_state.file_extraction_results = {}  # Store extraction results
         logger.info("Initialized extraction session state")
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def preprocess_image(image, enhance_resolution=True):
-    """
-    Preprocess image to improve OCR results
-    """
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # Apply thresholding to get a binary image
-    _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # Remove noise
-    denoised = cv2.fastNlMeansDenoising(binary, None, 10, 7, 21)
-    
-    # Increase resolution if requested
-    if enhance_resolution:
-        return cv2.resize(denoised, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-    
-    return denoised
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def clean_ocr_text(text):
-    """Clean up common OCR errors and formatting issues"""
-    if not text:
-        return ""
-    
-    # Replace multiple newlines with a single one
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    
-    # Remove isolated single characters (likely OCR errors)
-    text = re.sub(r'(?<!\w)([a-zA-Z])(?!\w)', ' ', text)
-    
-    # Fix common OCR errors
-    text = text.replace('|', 'I').replace('0', 'O')
-    
-    # Normalize whitespace
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Fix broken sentences (period followed by lowercase)
-    text = re.sub(r'(\.)([a-z])', r'\1 \2', text)
-    
-    return text.strip()
-
-# --- New Technical Text Pre-processing Functions ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def preprocess_technical_text(text: str) -> str:
-    """Apply specialized pre-processing for technical architectural/engineering text."""
-    if not text:
-        return ""
-        
-    processed_text = text
-    
-    # Standardize units of measurement
-    processed_text = standardize_measurements(processed_text)
-    
-    # Fix common building code references
-    processed_text = standardize_code_references(processed_text)
-    
-    # Improve technical terminology
-    processed_text = fix_technical_terminology(processed_text)
-    
-    # Format lists and specifications consistently
-    processed_text = format_specifications(processed_text)
-    
-    return processed_text
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def standardize_measurements(text: str) -> str:
-    """Standardize and fix common measurement formats in architectural text."""
-    if not text:
-        return ""
-        
-    # Convert fraction notations to decimal (e.g., 1-1/2" → 1.5")
-    text = re.sub(r'(\d+)-(\d+)/(\d+)"', lambda m: f"{int(m.group(1)) + int(m.group(2))/int(m.group(3))}\"", text)
-    
-    # Fix spacing in dimensions (e.g., 2' 6" → 2'-6")
-    text = re.sub(r'(\d+)\'(\s*)(\d+)"', r"\1'-\3\"", text)
-    
-    # Standardize unit spacing (e.g., "50 mm" → "50mm", "20 psf" → "20psf")
-    units = ['mm', 'cm', 'in', 'ft', 'psf', 'psi', 'ksi', 'pcf', 'sq ft', 'kg']
-    for unit in units:
-        text = re.sub(rf'(\d+)\s+{unit}', rf'\1{unit}', text)
-    
-    return text
-    
-@st.cache_data(ttl=3600, show_spinner=False)
-def standardize_code_references(text: str) -> str:
-    """Standardize building code references."""
-    if not text:
-        return ""
-        
-    # Standardize code references (e.g., "ASTM C 90" → "ASTM C90")
-    text = re.sub(r'(ASTM|ANSI|ACI|AISI|IBC|IPC)\s+([A-Z])\s+(\d+)', r'\1 \2\3', text)
-    
-    # Standardize section references (e.g., "Sec. 4.2.1" → "Section 4.2.1")
-    text = re.sub(r'(?i)(sec|sect)\.?\s+(\d+\.\d+)', r'Section \2', text)
-    
-    return text
-    
-@st.cache_data(ttl=3600, show_spinner=False)
-def fix_technical_terminology(text: str) -> str:
-    """Fix common technical terms that might be misspelled by OCR."""
-    if not text:
-        return ""
-        
-    # Dictionary of common OCR errors in technical terms
-    corrections = {
-        "relnforced": "reinforced",
-        "concreie": "concrete",
-        "concrele": "concrete",
-        "structurai": "structural",
-        "sieel": "steel",
-        "steei": "steel",
-        "specificaiions": "specifications",
-        "lnsulation": "insulation",
-        "lnstallation": "installation",
-        "fastenlng": "fastening"
-    }
-    
-    for error, correction in corrections.items():
-        text = re.sub(rf'\b{error}\b', correction, text, flags=re.IGNORECASE)
-    
-    return text
-    
-@st.cache_data(ttl=3600, show_spinner=False)
-def format_specifications(text: str) -> str:
-    """Format specification lists and numbered items consistently."""
-    if not text:
-        return ""
-        
-    # Format numbered specifications (e.g., "1 Steel shall..." → "1. Steel shall...")
-    text = re.sub(r'(?<!\d)(\d+)(?!\d|\.)(\s+[A-Z])', r'\1.\2', text)
-    
-    # Format bullet points consistently
-    text = re.sub(r'(?<=\n)[\*\-•⦁◦] ?', '• ', text)
-    
-    return text
-
-# --- Enhanced Chunking Function for Better Context ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def chunk_text_with_context(text, chunk_size=1500, overlap=300):
-    """
-    Splits text into overlapping chunks with improved context preservation.
-    Tries to split at paragraph or sentence boundaries when possible.
-    
-    Args:
-        text: The text to split
-        chunk_size: Target size for each chunk
-        overlap: Minimum overlap between chunks
-    
-    Returns:
-        List of text chunks
-    """
-    if not text:
-        return []
-    
-    # Split by paragraphs first (preserve paragraph structure)
-    paragraphs = re.split(r'\n\s*\n', text)
-
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    
-    # Process paragraphs, preserving whole paragraphs when possible
-    for paragraph in paragraphs:
-        paragraph_words = paragraph.split()
-        paragraph_size = len(paragraph_words)
-        
-        # If a single paragraph is too large, we need to split it
-        if paragraph_size > chunk_size:
-            # If we have content in the current chunk, finish it first
-            if current_size > 0:
-                chunks.append(" ".join(current_chunk))
-                # Keep overlap with previous chunk for context
-                overlap_start = max(0, len(current_chunk) - overlap)
-                current_chunk = current_chunk[overlap_start:]
-                current_size = len(current_chunk)
-            
-            # Now split the large paragraph by sentences
-            sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-            for sentence in sentences:
-                sentence_words = sentence.split()
-                sentence_size = len(sentence_words)
-                
-                # If adding this sentence exceeds the chunk size
-                if current_size + sentence_size > chunk_size and current_size > 0:
-                    chunks.append(" ".join(current_chunk))
-                    # Keep overlap with previous chunk for context
-                    overlap_start = max(0, len(current_chunk) - overlap)
-                    current_chunk = current_chunk[overlap_start:]
-                    current_size = len(current_chunk)
-                
-                # Add sentence to current chunk
-                current_chunk.extend(sentence_words)
-                current_size += sentence_size
-        else:
-            # If adding this paragraph exceeds the chunk size
-            if current_size + paragraph_size > chunk_size and current_size > 0:
-                chunks.append(" ".join(current_chunk))
-                # Keep overlap with previous chunk for context
-                overlap_start = max(0, len(current_chunk) - overlap)
-                current_chunk = current_chunk[overlap_start:]
-                current_size = len(current_chunk)
-            
-            # Add paragraph to current chunk
-            current_chunk.extend(paragraph_words)
-            current_size += paragraph_size
-    
-    # Add the last chunk if it has content
-    if current_size > 0:
-        chunks.append(" ".join(current_chunk))
-    
-    # Filter out very short chunks
-    return [chunk for chunk in chunks if len(chunk.split()) > 30]
 
 # --- Cached Text Enhancement Function ---
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -632,6 +426,62 @@ def _cached_extract_text_from_pdf(
         logger.error(f"Error in _cached_extract_text_from_pdf (File hash: {file_hash}): {e}", exc_info=True)
         return []
 
+# Helper utilities for PDF processing
+def _read_pdf_content_and_hash(pdf_file: io.BytesIO) -> Tuple[bytes, str]:
+    """Return PDF bytes and a hash for caching."""
+    pdf_file.seek(0)
+    content = pdf_file.read()
+    pdf_file.seek(0)
+    return content, generate_file_hash(content)
+
+
+def _enhance_text_if_requested(preprocessed_text: str, enhance: bool, file_name: str, status_container, file_id: str) -> str:
+    """Optionally enhance text using the chosen model."""
+    full_text = preprocessed_text
+    if enhance and preprocessed_text:
+        model_used = st.session_state.get('model_preference', 'local')
+        status_container.info(f"File: {file_name} - Enhancing text with {model_used.upper()}...")
+        enhanced_text = enhance_text(preprocessed_text)
+        with status_container.expander(f"Show {model_used.upper()} Enhancement Comparison", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.text_area("Before Enhancement", preprocessed_text, height=200, key=f"before_{file_id}")
+            with col2:
+                st.text_area("After Enhancement", enhanced_text, height=200, key=f"after_{file_id}")
+        if enhanced_text != preprocessed_text:
+            logger.info(f"File: {file_name} - Text enhanced by {model_used.upper()}. New length: {len(enhanced_text)} chars.")
+            full_text = enhanced_text
+        else:
+            logger.info(f"File: {file_name} - Text enhancement by {model_used.upper()} did not change the text or failed.")
+    elif enhance:
+        logger.warning(f"File: {file_name} - Skipping enhancement as no initial text was extracted.")
+    return full_text
+
+
+def _generate_summary_and_embeddings(full_text: str, file_name: str, project_id: int, status_container, process_embeddings: bool) -> bool:
+    """Generate summary and, if requested, store embeddings."""
+    status_container.info(f"Generating document summary for {file_name}...")
+    document_summary = generate_document_summary(full_text, file_name)
+    with status_container.expander("Document Summary", expanded=True):
+        st.markdown(document_summary)
+
+    embedding_success = False
+    if process_embeddings and document_summary and not document_summary.startswith("Summary generation") and supabase and model:
+        status_container.info(f"File: {file_name} - Chunking SUMMARY...")
+        summary_chunks = chunk_text_with_context(document_summary, chunk_size=250, overlap=50)
+        if summary_chunks:
+            embedding_success = store_embeddings(project_id, summary_chunks, file_name)
+        else:
+            status_container.warning(f"File: {file_name} - Summary was too short to chunk.")
+            embedding_success = False
+    elif not process_embeddings:
+        logger.info(f"File: {file_name} - Embedding skipped by settings.")
+    elif not document_summary or document_summary.startswith("Summary generation"):
+        status_container.warning(f"File: {file_name} - No valid summary generated, skipping embedding.")
+    else:
+        status_container.warning(f"File: {file_name} - Supabase/Model not ready, skipping embedding.")
+    return embedding_success
+
 # --- Modified extract_text_from_single_pdf function ---
 def _extract_text_from_single_pdf(
     pdf_file: io.BytesIO, 
@@ -670,12 +520,7 @@ def _extract_text_from_single_pdf(
     # If not processed or no stored result, continue with extraction
     try:
         status_container.info(f"Processing file: {file_name}...")
-        pdf_file.seek(0)
-        pdf_content = pdf_file.read()
-        pdf_file.seek(0)
-        
-        # Get file hash for caching
-        file_hash = generate_file_hash(pdf_content)
+        pdf_content, file_hash = _read_pdf_content_and_hash(pdf_file)
         
         # Use cached extraction
         extracted_pages = _cached_extract_text_from_pdf(
@@ -692,68 +537,21 @@ def _extract_text_from_single_pdf(
             status_container.warning(f"No text extracted from {file_name}")
             return "", False
         
-        # Apply basic technical preprocessing right after extraction
         preprocessed_text = preprocess_technical_text(initial_extracted_text)
-        full_extracted_text = preprocessed_text # Start with preprocessed text
+        full_extracted_text = preprocessed_text
         
         logger.info(f"File: {file_name} - Initial extracted text length: {len(initial_extracted_text)} chars.")
         logger.info(f"File: {file_name} - After basic preprocessing: {len(preprocessed_text)} chars.")
 
-        # --- Gemma Enhancement Step --- (Step 11)
-        if enhance_with_gemma and preprocessed_text: # Use preprocessed text for check
-            # Determine which model is being used for logging/display
-            model_used_for_enhancement = st.session_state.get('model_preference', 'local')
-            status_container.info(f"File: {file_name} - Enhancing text with {model_used_for_enhancement.upper()}...")
-            
-            # Call the updated enhance_text function
-            enhanced_text = enhance_text(preprocessed_text) 
-            
-            # Display comparison
-            with status_container.expander(f"Show {model_used_for_enhancement.upper()} Enhancement Comparison", expanded=True):
-                col1_comp, col2_comp = st.columns(2)
-                with col1_comp:
-                    st.text_area("Before Enhancement", preprocessed_text, height=200, key=f"before_{file_id}")
-                with col2_comp:
-                    st.text_area("After Enhancement", enhanced_text, height=200, key=f"after_{file_id}")
-            
-            if enhanced_text != preprocessed_text:
-                 logger.info(f"File: {file_name} - Text enhanced by {model_used_for_enhancement.upper()}. New length: {len(enhanced_text)} chars.")
-                 full_extracted_text = enhanced_text # Update text to be used for embedding
-            else:
-                 logger.info(f"File: {file_name} - Text enhancement by {model_used_for_enhancement.upper()} did not change the text or failed.")
-                 # Keep full_extracted_text as preprocessed_text
-        elif enhance_with_gemma:
-             logger.warning(f"File: {file_name} - Skipping enhancement as no initial text was extracted.")
+        full_extracted_text = _enhance_text_if_requested(preprocessed_text, enhance_with_gemma, file_name, status_container, file_id)
         
-        # --- Generate Document Summary ---
-        # Always generate a document summary, regardless of text enhancement
-        status_container.info(f"Generating document summary for {file_name}...")
-        document_summary = generate_document_summary(full_extracted_text, file_name)
-        
-        # Display generated summary
-        with status_container.expander("Document Summary", expanded=True):
-            st.markdown(document_summary)
-            
-        # --- Chunking, Embedding, and Storage of SUMMARY ---
-        if process_embeddings and document_summary and not document_summary.startswith("Summary generation") and supabase and model:
-            status_container.info(f"File: {file_name} - Chunking SUMMARY...") 
-            # Chunk the summary with smaller settings
-            summary_chunks = chunk_text_with_context(document_summary, chunk_size=250, overlap=50) 
-            if summary_chunks:
-                # Pass file_name to store_embeddings
-                embedding_success = store_embeddings(project_id, summary_chunks, file_name)
-            else:
-                status_container.warning(f"File: {file_name} - Summary was too short to chunk.")
-                embedding_success = False # No chunks to embed
-        elif not process_embeddings: 
-            logger.info(f"File: {file_name} - Embedding skipped by settings.")
-            embedding_success = False # Embeddings not processed
-        elif not document_summary or document_summary.startswith("Summary generation"): 
-            status_container.warning(f"File: {file_name} - No valid summary generated, skipping embedding.")
-            embedding_success = False # No summary to embed
-        else: 
-            status_container.warning(f"File: {file_name} - Supabase/Model not ready, skipping embedding.")
-            embedding_success = False # Cannot process embeddings
+        embedding_success = _generate_summary_and_embeddings(
+            full_extracted_text,
+            file_name,
+            project_id,
+            status_container,
+            process_embeddings,
+        )
         
         # Mark file as processed and store result (storing full text for potential future use, not embedding)
         mark_file_as_processed(file_id, project_id, full_extracted_text)
@@ -871,134 +669,3 @@ def render_text_tab(uploaded_files: List[io.BytesIO]) -> str:
             
     # Return combined text (relevant for Upload mode, empty for Load mode)
     return combined_text 
-
-# --- Cached Document Summarization Function ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_generate_document_summary(text_to_summarize: str, document_name: str) -> str:
-    """
-    Cached function to generate a document summary using AI.
-    Uses either local Ollama/Gemma or Google Gemini API based on user preferences.
-    
-    Args:
-        text_to_summarize: Document text to summarize
-        document_name: Name of the document for context
-        
-    Returns:
-        Summary text that provides a high-level overview of the document
-    """
-    if not text_to_summarize or len(text_to_summarize.strip()) < 100:
-        return "Insufficient text to generate a meaningful summary."
-        
-    model_preference = st.session_state.get('model_preference', 'local')
-    google_api_key = st.session_state.get('google_api_key', None)
-    
-    # Detailed, section-based information extraction prompt
-    prompt = f"""You are an expert technical analyst tasked with creating a DETAILED INFORMATION EXTRACTION from an architectural or engineering document named "{document_name}".
-
-Your goal is to process the document section by section and extract the most critical information.
-
-Instructions:
-1.  First, try to identify the main sections of the document (e.g., Introduction, Specifications, Load Calculations, Material Requirements, Compliance Statements, Conclusion, Appendices, etc.).
-2.  For EACH identified section, provide a concise summary of that section's purpose AND extract the most important technical details, data, specifications, measurements, code references, and key findings presented within that section.
-3.  Structure your output clearly, perhaps using headings for each section you identify.
-4.  Be comprehensive. The goal is NOT a brief overview, but a detailed extraction of core information that would be useful for answering specific technical questions about the document later.
-5.  If the document is short or does not have clearly defined sections, then provide a detailed extraction of all key information found.
-6.  Preserve all numerical values, dimensions, units, and technical terminology accurately.
-7.  Focus on factual information extraction. Avoid interpretation or adding information not present in the text.
-
-Document text:
-{text_to_summarize}
-
-DETAILED INFORMATION EXTRACTION:"""
-    
-    try:
-        if model_preference == 'local':
-            # Use Ollama/Gemma
-            if not ollama_client:
-                logger.warning("Ollama client not initialized. Cannot generate document summary.")
-                return "Summary generation unavailable: Ollama client not initialized."
-                
-            logger.info(f"Generating document summary for '{document_name}' with Ollama...")
-            
-            # Chunk if necessary (for very large documents)
-            if len(text_to_summarize) > 12000: # Adjusted threshold for potentially longer prompt/output
-                # Only use the beginning and end portions for summary if very large
-                beginning = text_to_summarize[:6000]
-                end = text_to_summarize[-6000:]
-                # Ensure the prompt is applied to the shortened text
-                current_prompt = prompt.replace(text_to_summarize, beginning + "\n\n[...middle content omitted...]\n\n" + end)
-            else:
-                current_prompt = prompt
-                
-            response = ollama_client.chat(
-                model="gemma3:4b",
-                messages=[{'role': 'user', 'content': current_prompt}],
-                stream=False
-            )
-            
-            summary = response['message']['content'].strip()
-            logger.info(f"Generated detailed information extraction with Ollama for '{document_name}'")
-            return summary
-            
-        elif model_preference == 'api':
-            # Use Google Gemini API
-            if not google_api_key:
-                logger.warning("Google API Key not provided. Cannot generate document summary.")
-                return "Summary generation unavailable: Google API Key not provided."
-                
-            try:
-                import google.generativeai as genai
-                genai.configure(api_key=google_api_key)
-                
-                gemini_model_name = 'gemini-1.5-flash-latest'
-                model = genai.GenerativeModel(gemini_model_name)
-                
-                logger.info(f"Generating document summary for '{document_name}' with Gemini API...")
-                
-                # Chunk if necessary (for very large documents)
-                if len(text_to_summarize) > 12000: # Adjusted threshold
-                    # Only use the beginning and end portions for summary if very large
-                    beginning = text_to_summarize[:6000]
-                    end = text_to_summarize[-6000:]
-                    # Ensure the prompt is applied to the shortened text
-                    current_prompt = prompt.replace(text_to_summarize, beginning + "\n\n[...middle content omitted...]\n\n" + end)
-                else:
-                    current_prompt = prompt
-                
-                response = model.generate_content(current_prompt)
-                summary = response.text.strip()
-                logger.info(f"Generated detailed information extraction with Gemini API for '{document_name}'")
-                return summary
-                
-            except ImportError:
-                logger.error("google.generativeai library not installed. Cannot use Gemini API.")
-                return "Summary generation unavailable: Google AI library not installed."
-            except Exception as api_error:
-                logger.error(f"Error calling Google Gemini API for document summary: {api_error}", exc_info=True)
-                return f"Summary generation failed: {api_error}"
-                
-        else:
-            logger.warning(f"Unknown model preference: {model_preference}. Cannot generate document summary.")
-            return "Summary generation unavailable: Unknown model preference."
-            
-    except Exception as e:
-        logger.error(f"Error generating document summary: {e}", exc_info=True)
-        return f"Summary generation failed: {e}"
-        
-# --- Public Document Summarization Function ---
-def generate_document_summary(text: str, document_name: str) -> str:
-    """
-    Public function to generate a document summary.
-    Uses cached implementation for efficiency.
-    
-    Args:
-        text: Document text to summarize
-        document_name: Name of the document
-        
-    Returns:
-        Document summary
-    """
-    if not text or len(text.strip()) < 100:
-        return "Insufficient text to generate a meaningful summary."
-        
-    return _cached_generate_document_summary(text, document_name) 
